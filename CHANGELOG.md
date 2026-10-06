@@ -5,6 +5,20 @@ Versioned according to [Semantic Versioning](http://semver.org/).
 
 ## Unreleased
 
+Fixed:
+
+  * `do_work_of_slopes_new_curved`: crash (shape mismatch) with `-cl` when a dilated region contour exceeds the image border
+
+Changed:
+
+  * :zap: speed up CPU-side processing (results identical):
+    - deskewing (`return_deskew_slop`): only warp the non-empty content into the reachable band of rows
+      instead of the full padded canvas, count pixels without intermediate copies (2-3x faster)
+    - `small_textlines_to_parent_adherence2` (`-cl`): rasterize intersections only within bounding boxes
+      instead of full-page masks per pair of contours (was quadratic, e.g. 145s → <1s on a 3-column page)
+    - model input: resize before normalizing (nearest neighbour), normalize via lookup table (~20x faster)
+    - light textline mode: only test textlines centered within a region's bounding box
+
 ## [0.9.2] - 2026-07-28
 
 Fixed:
