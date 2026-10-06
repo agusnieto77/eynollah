@@ -989,16 +989,30 @@ def small_textlines_to_parent_adherence2(textlines_con, textline_mask, num_col):
         img_large = cv2.fillPoly(img_large, pts=textlines_large, color=1)
         img_inter = img_small + img_large == 2
         if np.any(img_inter):
+            height, width = textline_mask.shape[:2]
+            boxes_large = [cv2.boundingRect(contour_large) for contour_large in textlines_large]
             indexes_textlines_inter = []
             for contour_small in textlines_small:
-                intersections = []
-                for contour_large in textlines_large:
-                    img0_small = np.zeros_like(textline_mask)
-                    img0_small = cv2.fillPoly(img0_small, pts=[contour_small], color=1)
-                    img0_large = np.zeros_like(textline_mask)
-                    img0_large = cv2.fillPoly(img0_large, pts=[contour_large], color=1)
-                    img0_inter = img0_small + img0_large == 2
-                    intersections.append(np.count_nonzero(img0_inter))
+                # intersections can only occur within the bbox of the small contour
+                # (so rasterize there instead of on full page, and only overlapping
+                #  large contours - identical result, but much faster)
+                x, y, w, h = cv2.boundingRect(contour_small)
+                x0, y0 = max(0, x), max(0, y)
+                x1, y1 = min(width, x + w), min(height, y + h)
+                intersections = np.zeros(len(textlines_large), dtype=int)
+                if x0 < x1 and y0 < y1:
+                    shift = np.array([x0, y0])
+                    img0_small = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+                    img0_small = cv2.fillPoly(img0_small, pts=[(contour_small - shift).astype(np.int32)],
+                                              color=1)
+                    for idx_large, contour_large in enumerate(textlines_large):
+                        lx, ly, lw, lh = boxes_large[idx_large]
+                        if lx >= x1 or lx + lw <= x0 or ly >= y1 or ly + lh <= y0:
+                            continue
+                        img0_large = np.zeros_like(img0_small)
+                        img0_large = cv2.fillPoly(img0_large, pts=[(contour_large - shift).astype(np.int32)],
+                                                  color=1)
+                        intersections[idx_large] = np.count_nonzero(img0_small & img0_large)
                 idx_large = np.argmax(intersections)
                 if intersections[idx_large] <= 0:
                     idx_large = -1

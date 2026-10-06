@@ -97,6 +97,15 @@ RATIO_OF_TWO_MODEL_THRESHOLD = 95.50 #98.45:
 DPI_THRESHOLD = 298
 MAX_SLOPE = 999
 KERNEL = np.ones((5, 5), np.uint8)
+# lookup table for (fast but identical) uint8 to float16 model input normalization
+FLOAT16_OF_UINT8 = (np.arange(256) / 255.).astype(np.float16)
+
+
+def normalize_image(img):
+    """scale pixel values from [0, 255] to [0, 1] as float16"""
+    if img.dtype == np.uint8:
+        return FLOAT16_OF_UINT8[img]
+    return (img / 255.).astype(np.float16)
 
 
 _instance = None
@@ -332,8 +341,8 @@ class Eynollah:
                 img_1ch = img_1ch[page_coord[0]: page_coord[1],
                                   page_coord[2]: page_coord[3]]
                 img_in = np.repeat(img_1ch[:, :, np.newaxis], 3, axis=2)
-            img_in = img_in / 255.0
-            img_in = cv2.resize(img_in, (448, 448), interpolation=cv2.INTER_NEAREST).astype(np.float16)
+            # (nearest-neighbour resizing commutes with normalization, so resize first)
+            img_in = normalize_image(cv2.resize(img_in, (448, 448), interpolation=cv2.INTER_NEAREST))
 
             label_p_pred = self.model_zoo.get("col_classifier").predict(img_in[np.newaxis], verbose=0)[0]
             num_col = np.argmax(label_p_pred) + 1
@@ -401,8 +410,8 @@ class Eynollah:
                 img_1ch = img_1ch[page_coord[0]: page_coord[1],
                                   page_coord[2]: page_coord[3]]
                 img_in = np.repeat(img_1ch[:, :, np.newaxis], 3, axis=2)
-            img_in = img_in / 255.0
-            img_in = cv2.resize(img_in, (448, 448), interpolation=cv2.INTER_NEAREST).astype(np.float16)
+            # (nearest-neighbour resizing commutes with normalization, so resize first)
+            img_in = normalize_image(cv2.resize(img_in, (448, 448), interpolation=cv2.INTER_NEAREST))
 
             label_p_pred = self.model_zoo.get("col_classifier").predict(img_in[np.newaxis], verbose=0)[0]
             num_col = np.argmax(label_p_pred) + 1
@@ -456,11 +465,9 @@ class Eynollah:
         img_h_page = img.shape[0]
         img_w_page = img.shape[1]
 
-        img = img / 255.
-        img = img.astype(np.float16)
-
         if not patches:
-            img = resize_image(img, img_height_model, img_width_model)
+            # (nearest-neighbour resizing commutes with normalization, so resize first)
+            img = normalize_image(resize_image(img, img_height_model, img_width_model))
 
             label_p_pred = model.predict(img[np.newaxis], verbose=0)[0]
             if is_enhancement:
@@ -481,6 +488,7 @@ class Eynollah:
 
             return resize_image(seg, img_h_page, img_w_page)
 
+        img = normalize_image(img)
         if img_h_page < img_height_model:
             img = resize_image(img, img_height_model, img.shape[1])
         if img_w_page < img_width_model:
@@ -626,13 +634,11 @@ class Eynollah:
         self.logger.debug("enter do_prediction_new_concept (patches=%d)", patches)
         _, img_height_model, img_width_model, _ = model.input_shape
 
-        img = img / 255.0
-        img = img.astype(np.float16)
-
         if not patches:
             img_h_page = img.shape[0]
             img_w_page = img.shape[1]
-            img = resize_image(img, img_height_model, img_width_model)
+            # (nearest-neighbour resizing commutes with normalization, so resize first)
+            img = normalize_image(resize_image(img, img_height_model, img_width_model))
 
             label_p_pred = model.predict(img[np.newaxis], verbose=0)[0]
             seg = np.argmax(label_p_pred, axis=2).astype(np.uint8)
@@ -658,6 +664,7 @@ class Eynollah:
             conf = resize_image(conf, img_h_page, img_w_page)
             return prediction, conf
 
+        img = normalize_image(img)
         if img.shape[0] < img_height_model:
             img = resize_image(img, img_height_model, img.shape[1])
         if img.shape[1] < img_width_model:
@@ -761,7 +768,7 @@ class Eynollah:
 
         # decode
         seg = np.argmax(prediction, axis=2).astype(np.uint8)
-        conf = prediction[tuple(np.indices(seg.shape)) + (seg,)]
+        conf = np.take_along_axis(prediction, seg[:, :, np.newaxis].astype(np.intp), axis=2)[:, :, 0]
         if thresholding_for_artificial_class:
             seg_art = prediction[:, :, artificial_class] >= threshold_art_class
             seg_mask_label(seg, seg_art,
@@ -786,8 +793,7 @@ class Eynollah:
             artificial_class=4,
     ):
         self.logger.debug("enter do_prediction_new_concept (%s)", model.name)
-        img = img / 255.0
-        img = img.astype(np.float16)
+        img = normalize_image(img)
 
         prediction = model.predict(img[np.newaxis])[0]
         confidence = prediction[:, :, 1]
@@ -950,16 +956,21 @@ class Eynollah:
         w_h_textlines = [cv2.boundingRect(polygon)[2:] for polygon in polygons_of_textlines]
         args_textlines = np.arange(len(polygons_of_textlines))
 
+        cx_textlines_arr = np.array(cx_textlines)
+        cy_textlines_arr = np.array(cy_textlines)
+
         all_found_textline_polygons = []
         slopes = []
         for index, contour in enumerate(contours_par):
-            results = [cv2.pointPolygonTest(contour,
-                                            (cx_textlines[ind],
-                                             cy_textlines[ind]),
-                                            False)
-                       for ind in args_textlines]
-            results = np.array(results)
-            indexes_in = args_textlines[results == 1]
+            # only test textlines centered within the bbox of the region
+            x, y, w, h = cv2.boundingRect(contour)
+            candidates = args_textlines[(cx_textlines_arr >= x) & (cx_textlines_arr <= x + w) &
+                                        (cy_textlines_arr >= y) & (cy_textlines_arr <= y + h)]
+            indexes_in = [ind for ind in candidates
+                          if cv2.pointPolygonTest(contour,
+                                                  (cx_textlines[ind],
+                                                   cy_textlines[ind]),
+                                                  False) == 1]
             textlines_in = self.get_textlines_of_a_textregion_sorted(
                 [polygons_of_textlines[ind] for ind in indexes_in],
                 [cx_textlines[ind] for ind in indexes_in],

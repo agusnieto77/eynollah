@@ -26,7 +26,6 @@ from .contour import (
     find_contours_mean_y_diff,
 )
 from . import (
-    find_num_col_deskew,
     box2rect,
 )
 
@@ -1408,13 +1407,68 @@ def separate_lines_new2(img_crop, _, num_col, slope_region, logger=None, plotter
 
     return img_crop_revised
 
-def do_image_rotation(angle, img=None, sigma_des=1.0, logger=None):
+class RotatedProjection:
+    """
+    Horizontal projection profiles (number of non-zero pixels per row)
+    of an image after placing it centered on a square canvas (10% larger
+    than its longer side) and rotating that via `rotate_image`.
+
+    Equivalent to rotating the full (mostly empty) canvas, but much faster:
+    only the bounding box of the non-zero content is warped, and only into
+    the band of rows it can reach after rotation. (Output columns keep their
+    absolute positions, so OpenCV's fixed-point coordinate rounding and
+    thus the result is identical to warping the full canvas.)
+    """
+    def __init__(self, img):
+        height, width = img.shape[:2]
+        self.size = size = int(np.max(img.shape) * 1.1)
+        self.center = (size // 2, size // 2)
+        rows = np.flatnonzero(np.any(img, axis=1))
+        cols = np.flatnonzero(np.any(img, axis=0))
+        if not len(rows):
+            self.content = None
+            return
+        top, bottom = rows[0], rows[-1] + 1
+        left, right = cols[0], cols[-1] + 1
+        # binarize (so interpolated values are non-negative),
+        # but keep float64 like the canvas (other dtypes interpolate differently)
+        self.content = (img[top: bottom, left: right] != 0).astype(float)
+        # position of content on canvas
+        self.offset = np.array([int(0.5 * (size - width)) + left,
+                                int(0.5 * (size - height)) + top], dtype=float)
+
+    def profile(self, angle):
+        profile = np.zeros(self.size)
+        if self.content is None:
+            return profile
+        matrix = cv2.getRotationMatrix2D(self.center, angle, 1.0)
+        # find target area of content (with 1px of interpolation support)
+        height, width = self.content.shape
+        x0, y0 = self.offset
+        corners = np.array([[x0 - 1, y0 - 1, 1],
+                            [x0 + width, y0 - 1, 1],
+                            [x0 - 1, y0 + height, 1],
+                            [x0 + width, y0 + height, 1]])
+        target = corners @ matrix.T
+        right = min(self.size, int(np.ceil(target[:, 0].max())) + 3)
+        top = max(0, int(np.floor(target[:, 1].min())) - 2)
+        bottom = min(self.size, int(np.ceil(target[:, 1].max())) + 3)
+        if right <= 0 or top >= bottom:
+            return profile
+        # map from content (instead of canvas) to row band (instead of canvas)
+        matrix[:, 2] = matrix[:, :2] @ self.offset + matrix[:, 2] - [0, top]
+        rotated = cv2.warpAffine(self.content, matrix, (right, bottom - top))
+        # count non-zero pixels per row (faster than np.count_nonzero)
+        profile[top: bottom] = cv2.reduce((rotated > 0).view(np.uint8), 1,
+                                          cv2.REDUCE_SUM, dtype=cv2.CV_32S)[:, 0]
+        return profile
+
+def do_image_rotation(angle, projection=None, sigma_des=1.0, logger=None):
     if logger is None:
         logger = getLogger(__package__)
-    img_rot = rotate_image(img, angle)
-    img_rot[img_rot!=0] = 1
     try:
-        var = find_num_col_deskew(img_rot, sigma_des, 20.3)
+        z = gaussian_filter1d(projection.profile(angle), sigma_des)
+        var = np.std(z)
     except:
         logger.exception("cannot determine variance for angle %.2f°", angle)
         var = 0
@@ -1431,17 +1485,10 @@ def return_deskew_slop(img,
         plotter.save_plot_of_textline_density(img, name)
 
     height, width = img.shape[:2]
-    max_shape = int(np.max(img.shape) * 1.1)
-
-    onset_x = int(0.5 * (max_shape - width))
-    onset_y = int(0.5 * (max_shape - height))
-
-    img_resized = np.zeros((max_shape, max_shape))
-    img_resized[onset_y: onset_y + height,
-                onset_x: onset_x + width] = img
+    projection = RotatedProjection(img)
 
     def best_angle(angles):
-        return get_smallest_skew(img_resized, sigma_des, angles,
+        return get_smallest_skew(projection, sigma_des, angles,
                                  logger=logger,
                                  name=name,
                                  plotter=plotter)
@@ -1469,10 +1516,10 @@ def return_deskew_slop(img,
 
     return angle
 
-def get_smallest_skew(img, sigma_des, angles, logger=None, plotter=None, name=None):
+def get_smallest_skew(projection, sigma_des, angles, logger=None, plotter=None, name=None):
     if logger is None:
         logger = getLogger(__package__)
-    results = [do_image_rotation(angle, img=img, sigma_des=sigma_des, logger=logger)
+    results = [do_image_rotation(angle, projection=projection, sigma_des=sigma_des, logger=logger)
                for angle in angles]
     if plotter:
         plotter.save_plot_of_rotation_angle(angles, results, name)
@@ -1506,7 +1553,16 @@ def do_work_of_slopes_new_curved(
 
     mask_parent = np.zeros((h, w), dtype=np.uint8)
     mask_parent = cv2.fillPoly(mask_parent, pts=[contour_par - [x, y]], color=1)
-    all_text_region_raw = textline_mask_tot_ea[y: y + h, x: x + w] * mask_parent
+    # (dilated) region contours may extend beyond the image border,
+    # so crop with zero padding to keep the box size consistent
+    all_text_region_raw = np.zeros((h, w), dtype=textline_mask_tot_ea.dtype)
+    img_h, img_w = textline_mask_tot_ea.shape[:2]
+    y0, y1 = max(0, y), min(img_h, y + h)
+    x0, x1 = max(0, x), min(img_w, x + w)
+    if y0 < y1 and x0 < x1:
+        all_text_region_raw[y0 - y: y1 - y,
+                            x0 - x: x1 - x] = textline_mask_tot_ea[y0: y1, x0: x1]
+    all_text_region_raw *= mask_parent
     if not np.any(all_text_region_raw):
         return [], slope_deskew
     img_int_p = np.copy(all_text_region_raw)
